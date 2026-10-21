@@ -142,6 +142,65 @@ describe("lastTurnEndOf：取日志里最新一条结束证据", () => {
   });
 });
 
+/**
+ * 会话日志里还有三类不属于完成证据的事件：`job/registered`、`job/settled`、
+ * `working-directory/change`。它们由宿主的 jobs 与 working-directory 插件追加，与通知判定
+ * 无关，但会真实出现在同一份日志里。
+ *
+ * 它们进入 `SessionEventMap` 走的是**声明合并**（`dsh-jobs-local` / `dsh-working-directory`
+ * 各自 augment），而本包不 import 这两个包——本文件看到的 `SessionEvent` 联合里没有它们，
+ * `as unknown as SessionEvent` 是运行时的必要收口，不是掩盖类型错误。真实宿主装齐这两个插件
+ * 后，它们会真的长进会话日志。
+ *
+ * 本域的证据读取是「倒序扫描指定 type」，必须对日志里其它类型保持无感：这些追加会与
+ * `turn/end`、`session/title` 交错，一旦有人把倒序扫描改成「只看最后一条」，完成通知与任务名
+ * 会先在这些事件上断掉，且只在特定会话里出现。真实事件的顺序与交错由
+ * `test/integration/real-context.test.ts` 的「新增会话事件下的完成证据与生命周期契约」一节在
+ * 真实 cordis 总线上覆盖。
+ *
+ * 断言只钉契约面（读到什么、是否算证据），不复制宿主事件信封：这三类事件这里只造被读的 type。
+ */
+describe("新增会话事件不改变证据读取语义", () => {
+  const ADDED_SESSION_EVENT_TYPES = [
+    "job/registered",
+    "job/settled",
+    "working-directory/change",
+  ] as const;
+
+  function addedSessionEvent(type: string): SessionEvent {
+    return { type, data: {} } as unknown as SessionEvent;
+  }
+
+  it("新增会话事件不是 turn/end 证据", () => {
+    for (const type of ADDED_SESSION_EVENT_TYPES) {
+      expect(turnEndEvidenceOf(addedSessionEvent(type)), type).toEqual({ found: false });
+    }
+  });
+
+  it("turn/end 之后尾随新增会话事件时仍取到最新结束证据（倒序扫描不改）", () => {
+    const agent = makeAgent("s-tail-events", {
+      events: [
+        turnEndEvent(2),
+        ...ADDED_SESSION_EVENT_TYPES.map((type) => addedSessionEvent(type)),
+      ],
+    });
+    expect(lastTurnEndOf(agent)).toEqual({
+      found: true,
+      evidence: { turn: 2, kind: "completed" },
+    });
+  });
+
+  it("session/title 之后尾随新增会话事件时仍取到最后一条标题", () => {
+    const agent = makeAgent("s-tail-title", {
+      events: [
+        titleEvent("任务名"),
+        ...ADDED_SESSION_EVENT_TYPES.map((type) => addedSessionEvent(type)),
+      ],
+    });
+    expect(sessionTitleOf(agent)).toEqual({ found: true, title: "任务名" });
+  });
+});
+
 describe("isSubagentOf：子代理归属判定", () => {
   it("origin 命中即真，不必再问注册表", () => {
     const agent = makeAgent("sub-origin", { header: { origin: "subagent" } });

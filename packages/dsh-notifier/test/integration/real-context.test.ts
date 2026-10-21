@@ -852,6 +852,243 @@ describe("宿主 agent 注册表（子代理归属）", () => {
   });
 });
 
+/**
+ * 新增会话事件（job/registered、job/settled、working-directory/change）的官方 payload 形状
+ * （来源：dsh-jobs-local / dsh-working-directory 的 session.append(...) 调用；notifier 只读事件
+ * type，这里保留可核验的字段以便对照官方产物）。
+ */
+function jobRegisteredEvent(owner: string): SessionEvent {
+  return {
+    type: "job/registered",
+    data: { jobId: "job-done", owner, kind: "bash", label: "sleep 5", startedAt: 1 },
+  } as unknown as SessionEvent;
+}
+
+function jobSettledEvent(owner: string): SessionEvent {
+  return {
+    type: "job/settled",
+    data: {
+      jobId: "job-done",
+      owner,
+      kind: "bash",
+      label: "sleep 5",
+      startedAt: 1,
+      finishedAt: 2,
+      status: "completed",
+      cause: "producer",
+      producerReported: true,
+    },
+  } as unknown as SessionEvent;
+}
+
+function workingDirectoryChangeEvent(cwd: string): SessionEvent {
+  return { type: "working-directory/change", data: { cwd } } as unknown as SessionEvent;
+}
+
+/** session/title 的官方数据形状（dsh-session-title：title / messageSeqs / source）。 */
+function titleEvent(title: string): SessionEvent {
+  return {
+    type: "session/title",
+    data: { title, messageSeqs: [], source: { kind: "fallback" } },
+  } as unknown as SessionEvent;
+}
+
+/**
+ * 事件链契约：**顺序**与**会话日志里的新增事件类型**是本节唯一的判据面。
+ *
+ * 事件顺序取自宿主生产代码，不是推测：
+ * 1. dsh-agent-loop 的 turn() 在普通结束路径上先 serial("agent/turn-stopping")，再在 finally
+ *    里 session.append("turn/end")；kick() 的最后才把 phase 置回 idle 并派发 agent/status: idle。
+ *    所以真实顺序是 turn-stopping → turn/end → idle。
+ * 2. 失败/取消路径不派发 turn-stopping（异常在 turn() 的 catch 分支直接落到 finally 的
+ *    turn/end），因此失败链只有 agent/error（失败时）+ turn/end + idle。
+ * 3. dsh-session.append() 在把事件推入日志的同一同步段派发 session/event，所以 turn/end 的
+ *    推送证据一定先于 idle 到达。
+ * 4. job/registered、job/settled、working-directory/change 也会进入会话日志词汇；
+ *    dsh-session-title 的标题是**异步追加**的，可以落在 turn/end 之后。
+ *
+ * 下面的用例只钉这些组合下的完成判定与通知行为；单点判定（去重、快照冻结、子代理归属）
+ * 仍由 test/unit/events/* 负责。
+ */
+describe("新增会话事件下的完成证据与生命周期契约", () => {
+  it("正常完成：turn-stopping → turn/end → idle 产出 turn-end 与 done，标题取自 session/title", async () => {
+    seed({ ...BASE_SETTINGS, notifyTurnEnd: true });
+    const { root, unmount } = await mount({});
+    const signal = new AbortController().signal;
+    const events: SessionEvent[] = [];
+    const agent = fakeAgent("itest-complete", events);
+    const session = fakeSession("itest-complete");
+
+    root.emit("agent/status", { agent, status: "running" });
+    // 标题既经 session/event 推送、也必须真的在日志快照里：任务名是从日志读的，不是从推送读的。
+    const title = titleEvent("任务标题");
+    events.push(title);
+    root.emit("session/event", session, title);
+    // turn-stopping 先于 turn/end 追加。
+    root.emit("agent/turn-stopping", { agent, turn: 1, signal });
+    events.push(turnEndEvent(1, "completed"));
+    root.emit("session/event", session, turnEndEvent(1, "completed"));
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await pollUntil(() => countKind("done") === 1, "完成通知落史");
+    // 界碑：历史写队列串行，界碑可见 = 此前排队的行都已落盘，顺序判据才不是抢跑得来的。
+    await settleHistory();
+    const kindOrder = historyLines()
+      .map((line) => line.kind)
+      .filter((kind) => kind !== SENTINEL_KIND);
+    // 顺序本身就是契约：turn-end 在 idle 结算（done）之前就已经产生。
+    expect(kindOrder).toEqual(["turn-end", "done"]);
+    expect(kindLine("done")?.message).toContain("任务标题");
+    expect(countKind("done")).toBe(1);
+    await unmount();
+  });
+
+  it("尾随的新增会话事件（job/*、working-directory/change）不改写完成判定与标题", async () => {
+    const { root, unmount } = await mount({});
+    const events: SessionEvent[] = [titleEvent("带尾随事件的任务"), turnEndEvent(1, "completed")];
+    // header.cwd 是**原始项目目录**；working-directory/change 的 cwd 是当前目录。两者不是同一字段，
+    // 本插件也不读它——判据是「切换目录后标题与结束证据的读取不变」，不是把两个字段当成一个。
+    const agent = fakeAgent("itest-tail-events", events, { cwd: "/proj/original" });
+    const session = fakeSession("itest-tail-events");
+
+    root.emit("agent/status", { agent, status: "running" });
+    root.emit("session/event", session, turnEndEvent(1, "completed"));
+    // 这些事件会与 turn/end 交错追加进同一份日志，且可以落在 idle 之前。
+    events.push(
+      jobRegisteredEvent("itest-tail-events"),
+      workingDirectoryChangeEvent("/proj/moved"),
+      jobSettledEvent("itest-tail-events"),
+    );
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await pollUntil(() => countKind("done") === 1, "尾随新事件下的完成通知");
+    await settleHistory();
+    expect(countKind("done")).toBe(1);
+    expect(kindLine("done")?.message).toContain("带尾随事件的任务");
+    // 新事件本身不是通知：日志里没有以它们为 kind 的历史行。
+    const kinds = historyLines().map((line) => line.kind ?? "");
+    expect(
+      kinds.some((kind) => kind.startsWith("job/") || kind === "working-directory/change"),
+    ).toBe(false);
+    // fixture 前提：两个目录字段确实不同（否则上面的「不读 header.cwd」判据没有意义）。
+    expect(agent.session.header.cwd).toBe("/proj/original");
+    await unmount();
+  });
+
+  it("turn/end 之后才追加的 session/title 仍被完成通知读到（标题异步追加）", async () => {
+    const { root, unmount } = await mount({});
+    const events: SessionEvent[] = [turnEndEvent(2, "completed")];
+    const agent = fakeAgent("itest-late-title", events);
+    const session = fakeSession("itest-late-title");
+
+    root.emit("agent/status", { agent, status: "running" });
+    root.emit("session/event", session, turnEndEvent(2, "completed"));
+    // 官方 session-title 的 provider/fallback 都是异步追加：标题可能比 turn/end 更晚落日志。
+    events.push(titleEvent("后到的标题"));
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await pollUntil(() => countKind("done") === 1, "后到标题下的完成通知");
+    expect(kindLine("done")?.message).toContain("后到的标题");
+    await unmount();
+  });
+
+  it("失败链：agent/error → turn/end(error) → idle 只报 error，不改报 done", async () => {
+    const { root, warns, unmount } = await mount({});
+    const events: SessionEvent[] = [titleEvent("会失败的任务")];
+    const agent = fakeAgent("itest-error-chain", events);
+    const session = fakeSession("itest-error-chain");
+
+    root.emit("agent/status", { agent, status: "running" });
+    root.emit("agent/error", { agent, turn: 2, step: 1, error: new Error("模型调用失败") });
+    events.push(turnEndEvent(2, "error"));
+    root.emit("session/event", session, turnEndEvent(2, "error"));
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await pollUntil(() => countKind("error") === 1, "错误通知落史");
+    await settleHistory();
+    expect(countKind("error")).toBe(1);
+    // 失败绝不能被误报成完成：这就是完成判定只看 kind 的那条分支。
+    expect(countKind("done")).toBe(0);
+    // 失败路径不派发 turn-stopping，故也不该有 turn-end。
+    expect(countKind("turn-end")).toBe(0);
+    expect(kindLine("error")?.message).toContain("模型调用失败");
+    expect(warns.some((line) => line.includes("完成判定跳过") && line.includes("kind=error"))).toBe(
+      true,
+    );
+    await unmount();
+  });
+
+  it("取消链：turn/end(aborted) → idle 不产出 done 或 error，并留下跳过诊断", async () => {
+    const { root, warns, unmount } = await mount({});
+    const events: SessionEvent[] = [];
+    const agent = fakeAgent("itest-abort-chain", events);
+    const session = fakeSession("itest-abort-chain");
+
+    root.emit("agent/status", { agent, status: "running" });
+    // 取消不派发 agent/error：turn() 的 catch 认出 abortedCancelCause 后直接以 turn/end 收尾。
+    events.push(turnEndEvent(3, "aborted"));
+    root.emit("session/event", session, turnEndEvent(3, "aborted"));
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await settleHistory();
+    expect(countKind("done")).toBe(0);
+    expect(countKind("error")).toBe(0);
+    expect(
+      warns.some((line) => line.includes("完成判定跳过") && line.includes("kind=aborted")),
+    ).toBe(true);
+    await unmount();
+  });
+
+  it("重放/重复事件：同一条 turn/end 推送两次、idle 再来一次，完成通知只有一条", async () => {
+    const { root, unmount } = await mount({});
+    const events: SessionEvent[] = [];
+    const agent = fakeAgent("itest-replay", events);
+    const session = fakeSession("itest-replay");
+    const completed = turnEndEvent(4, "completed");
+
+    root.emit("agent/status", { agent, status: "running" });
+    events.push(completed);
+    root.emit("session/event", session, completed);
+    // 重放同一条证据（断线补拉/重复读取的语义）：记录的是同一 turn，不能被当成第二次完成。
+    root.emit("session/event", session, completed);
+    root.emit("agent/status", { agent, status: "idle" });
+    root.emit("agent/status", { agent, status: "idle" });
+
+    await pollUntil(() => countKind("done") === 1, "重放下的完成通知");
+    await settleHistory();
+    expect(countKind("done")).toBe(1);
+    await unmount();
+  });
+
+  it("子代理与主代理事件交错：子代理完成落 subagent-done，不覆盖主任务完成", async () => {
+    const parentEvents: SessionEvent[] = [];
+    const parent = fakeAgent("itest-main", parentEvents, {});
+    const childEvents: SessionEvent[] = [];
+    const child = fakeAgent("itest-main-child", childEvents, {
+      parentSession: "itest-main",
+      origin: "subagent",
+    });
+    const { root, unmount } = await mount({ services: { agents: fakeAgents(parent, child) } });
+
+    // 交错到达：父任务 running 期间子代理先完成，然后父任务才完成。
+    root.emit("agent/status", { agent: parent, status: "running" });
+    root.emit("agent/status", { agent: child, status: "running" });
+    childEvents.push(titleEvent("子任务"), turnEndEvent(1, "completed"));
+    root.emit("session/event", fakeSession("itest-main-child"), turnEndEvent(1, "completed"));
+    root.emit("agent/status", { agent: child, status: "idle" });
+    await pollUntil(() => countKind("subagent-done") === 1, "子代理完成通知");
+
+    parentEvents.push(turnEndEvent(1, "completed"));
+    root.emit("session/event", fakeSession("itest-main"), turnEndEvent(1, "completed"));
+    root.emit("agent/status", { agent: parent, status: "idle" });
+
+    await pollUntil(() => countKind("done") === 1, "主任务完成通知");
+    expect(countKind("subagent-done")).toBe(1);
+    expect(countKind("done")).toBe(1);
+    await unmount();
+  });
+});
+
 describe("宿主 settings 服务：装配期同步割接存量配置", () => {
   /**
    * 链跑完之后磁盘上两条内置条目的形态（0.2.4 割接 + 0.2.9 形态清理的**终态**）。
